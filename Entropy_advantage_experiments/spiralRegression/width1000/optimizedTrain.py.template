@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[61]:
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torchmetrics.functional import r2_score
+from torch import nn
+import pickle
+import os
+
+import scipy.stats
+from scipy.signal import convolve2d, fftconvolve
+import math
+
+import sys
+import warnings
+
+import torchvision
+from torchvision.transforms import ToTensor, Normalize, Compose
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+
+
+num_epochs = 10000
+numData=aaaaa
+dThetaDR=2.0
+dataSeed=1
+np.random.seed(dataSeed)
+X=10*np.random.rand(numData, 2)-5
+r=np.sqrt(X[:,0]**2+X[:,1]**2)
+theta=np.arctan2(X[:,1], X[:,0])
+yy=(theta-dThetaDR*r)/2/np.pi
+y=yy-np.floor(yy)#target for regression, for two-class classification, one can use 0<y<0.5 as a class and 0.5<y<1 as another class
+y=np.sin(2*np.pi*y)
+y=y.reshape(-1, 1)
+
+
+seed=int(sys.argv[1])
+print("seed={}".format(seed))
+torch.manual_seed(seed)
+np.random.seed(seed)
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+# Split the data into train and test sets
+#X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=1000, random_state=2)
+X_train=X
+y_train=y
+
+# Convert the numpy arrays to PyTorch tensors
+X_train_WL = torch.tensor(X_train).to(torch.float32).to(device)
+y_train_WL = torch.tensor(y_train).to(torch.float32).to(device)
+
+
+data_num = len(X_train_WL)
+print('Number of WL data: ' + str(data_num))
+cut = data_num // 2
+
+train_X = X_train_WL[:cut]
+train_y = y_train_WL[:cut]
+
+val_X = X_train_WL[cut:cut*2]
+val_y = y_train_WL[cut:cut*2]
+
+
+
+
+from torch.utils import data
+def load_data(data_arrays, batch_size, is_train=True):
+    dataset = data.TensorDataset(*data_arrays)
+    return data.DataLoader(dataset, batch_size, shuffle=is_train)
+
+# In[21]:
+
+
+batch_size=10
+train_iter = load_data((train_X, train_y), batch_size)
+test_iter = load_data((val_X, val_y), batch_size)
+
+
+# Create an instance of the network
+net = nn.Sequential(nn.Linear(2, 1000), nn.ReLU(), nn.Linear(1000, 1000), nn.ReLU(), nn.Linear(1000, 1))
+net = net.to(device)
+
+
+def init_weights(m):
+    if type(m) == nn.Linear:
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+
+# In[26]:
+
+
+class Accumulator:
+    def __init__(self, n):
+        self.data = [0.0] * n
+
+    def add(self, *args):
+        self.data = [a + float(b) for a, b in zip(self.data, args)]
+
+    def reset(self):
+        self.data = [0.0] * len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+# In[27]:
+
+def train_epoch(net, train_iter, loss, updater):
+    if isinstance(net, torch.nn.Module):
+        net.train()
+    metric = Accumulator(3)  # Sum of training loss, no. of examples, r2 score
+    for X, y in train_iter:
+        y_hat = net(X)
+        l = loss(y_hat, y)
+        if isinstance(updater, torch.optim.Optimizer):
+            updater.zero_grad()
+            l.backward()
+            updater.step()
+            metric.add(float(l) * len(y), y.size().numel(), r2_score(y_hat, y)*len(y) )
+        else:
+            l.sum().backward()
+            for param in net.parameters():
+                print(param.grad)
+            updater(X.shape[0])
+            metric.add(float(l.sum()), y.numel(), r2_score(y_hat, y)*len(y) )
+    
+    return metric[0] / metric[1], metric[2] / metric[1]
+
+
+# In[28]:
+
+loss = nn.MSELoss()
+
+updater = torch.optim.Adam(net.parameters(), lr=2e-3)
+
+
+# In[30]:
+def test_metrics(net, test_iter, loss):
+    if isinstance(net, nn.Module):
+        net.eval()
+    metric = Accumulator(3)
+    with torch.no_grad():
+        for X, y in test_iter:
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            metric.add(float(l) * len(y), y.numel(), r2_score(y_hat, y)*len(y) )
+    return metric[0] / metric[1], metric[2] / metric[1]
+
+
+# In[31]:
+
+
+def train_net(net, train_iter, test_iter, loss, num_epochs, updater):
+    train_loss_sum, train_R2_sum, test_loss_sum, test_R2_sum = [], [], [], []
+    for epoch in range(num_epochs):
+        train_loss, train_R2 = train_epoch(net, train_iter, loss, updater)
+        train_loss, train_R2 = test_metrics(net, train_iter, loss)
+        test_loss, test_R2 = test_metrics(net, test_iter, loss)
+        if epoch % 100 == 0:
+            print(f"epoch {epoch+1}: train loss {train_loss}, train R2 {train_R2}, test loss {test_loss}, test R2 {test_R2}")
+        train_loss_sum.append(train_loss)
+        test_loss_sum.append(test_loss)
+        train_R2_sum.append(train_R2)
+        test_R2_sum.append(test_R2)
+    return train_loss_sum, test_loss_sum, train_R2_sum, test_R2_sum
+
+# In[36]:
+
+
+net.apply(init_weights)
+
+
+# ### test GPU time
+
+# In[34]:
+
+
+train_loss_sum, test_loss_sum, train_R2, test_R2 = train_net(net, train_iter, test_iter, loss, num_epochs, updater)
+
+
+# In[35]:
+
+np.savez_compressed("metrics.npz", train_loss=train_loss_sum, test_loss=test_loss_sum, train_R2=train_R2, test_R2=test_R2 )
+
+
+
